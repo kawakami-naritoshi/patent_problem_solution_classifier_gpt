@@ -3,512 +3,410 @@ import pandas as pd
 import time
 from datetime import datetime
 import io
-from openai import OpenAI
-import pickle
-import os
 import re
+from openai import OpenAI
 
 # ページ設定
 st.set_page_config(
-    page_title="PatentScope AI",
+    page_title="PatentClassifier AI",
     page_icon="🔬",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# レート制限設定（GPT-4o-mini用）
-RATE_LIMIT_DELAY = 1.0  # GPT-4o-miniは高いレート制限のため短縮
-BATCH_SIZE = 50  # バッチ処理サイズ
-CHECKPOINT_FILE = "checkpoint.pkl"  # チェックポイントファイル
+# レート制限設定
+RATE_LIMIT_DELAY = 0.1  # GPT-4o-mini用
+GPT4_DELAY = 3.0        # GPT-4.1系用
+
+# 利用可能なモデル一覧
+AVAILABLE_MODELS = {
+    "gpt-4o-mini": {"name": "GPT-4o-mini", "delay": RATE_LIMIT_DELAY, "cost": "低"},
+    "gpt-4.1":     {"name": "GPT-4.1",      "delay": GPT4_DELAY,     "cost": "高"}
+}
+PRECISION_REPROCESS_MODEL = "gpt-4.1"
 
 # セッション状態の初期化
-if 'processing_state' not in st.session_state:
-    st.session_state.processing_state = None
-if 'current_batch' not in st.session_state:
-    st.session_state.current_batch = 0
-if 'processed_data' not in st.session_state:
-    st.session_state.processed_data = None
+if 'invalid_rows_data' not in st.session_state:
+    st.session_state.invalid_rows_data = None
+if 'processed_df' not in st.session_state:
+    st.session_state.processed_df = None
+if 'final_invalid' not in st.session_state:
+    st.session_state.final_invalid = None
+if 'processing_complete' not in st.session_state:
+    st.session_state.processing_complete = False
+if 'manual_correction_complete' not in st.session_state:
+    st.session_state.manual_correction_complete = False
+if 'need_manual_correction' not in st.session_state:
+    st.session_state.need_manual_correction = False
+if 'problem_def_used' not in st.session_state:
+    st.session_state.problem_def_used = None
+if 'solution_def_used' not in st.session_state:
+    st.session_state.solution_def_used = None
 
-# メインヘッダー
-st.title("🔬 PatentScope AI")
-st.subheader("次世代特許分析プラットフォーム - AI駆動型知財インテリジェンス")
+# ヘッダー
+st.title("🔬 PatentClassifier AI")
+st.subheader("-AI駆動型特許自動分類アプリ")
 
-# 改善点の説明
-with st.expander("🔧 安定性向上機能", expanded=False):
-    st.markdown("### ✨ 新機能")
+with st.expander("🔧 最新機能", expanded=False):
     st.markdown("""
-    - **GPT-4o-mini採用**: 高速・高精度な分類処理
-    - **バッチ処理**: 大量データを小分けして処理
-    - **中断・再開機能**: 処理中断時も続きから再開可能
-    - **エラーハンドリング**: API エラー時の自動リトライ
-    - **プログレス保存**: 処理状況の自動保存
-    - **レート制限最適化**: GPT-4o-mini用に高速化（1秒間隔）
-    - **分類結果検証**: 定義された分類カテゴリとの一致をチェック
+    - **シンプル分類処理**: GPT-4o-miniで効率的な一括処理
+    - **GPT-4.1精密再処理**: 問題分類のみ自動修正
+    - **コスト最適化**: 必要最小限の高性能モデル使用
+    - **詳細ログ**: 使用モデル記録
     """)
 
-# 分類定義から有効なカテゴリを抽出する関数
-def extract_valid_categories(classification_def):
-    """分類定義から有効なカテゴリ名を抽出"""
-    categories = []
-    lines = classification_def.strip().split('\n')
-    for line in lines:
-        # [カテゴリ名] 形式を抽出
-        match = re.match(r'\[([^\]]+)\]', line.strip())
-        if match:
-            categories.append(match.group(1))
-    return categories
+# 有効カテゴリ抽出
+def extract_valid_categories(def_text: str) -> list:
+    lines = def_text.strip().split('\n')
+    return [m.group(1) for line in lines if (m := re.match(r'\[([^\]]+)\]', line))]
 
-# 分類結果を検証する関数
-def validate_classification_results(df, problem_categories, solution_categories):
-    """分類結果を検証し、問題のある行を特定"""
-    invalid_rows = {
-        'problem': [],
-        'solution': [],
-        'both': []
-    }
+# 分類結果検証
+def validate_classification_results(df: pd.DataFrame, problems: list, solutions: list) -> dict:
+    invalid = {'problem': [], 'solution': []}
+    # 無効な回答のパターン
+    invalid_patterns = ['該当なし', 'N/A', 'その他', 'None', 'なし', '不明', '該当無し', 'NA']
     
     for idx, row in df.iterrows():
-        problem_valid = True
-        solution_valid = True
-        
-        # 課題分類のチェック
-        if pd.notna(row.get('課題分類', '')):
-            p_class = str(row['課題分類']).strip()
-            if (p_class == "" or 
-                p_class.startswith("エラー:") or 
-                p_class == "該当するカテゴリはありません" or
-                p_class not in problem_categories):
-                problem_valid = False
-                invalid_rows['problem'].append({
-                    'index': idx + 1,  # 1-based index for display
-                    'value': p_class,
-                    'summary': row.get('要約', '')[:50] + '...' if len(str(row.get('要約', ''))) > 50 else row.get('要約', '')
-                })
-        
-        # 解決手段分類のチェック
-        if pd.notna(row.get('解決手段分類', '')):
-            s_class = str(row['解決手段分類']).strip()
-            if (s_class == "" or 
-                s_class.startswith("エラー:") or 
-                s_class == "該当するカテゴリはありません" or
-                s_class not in solution_categories):
-                solution_valid = False
-                invalid_rows['solution'].append({
-                    'index': idx + 1,
-                    'value': s_class,
-                    'summary': row.get('要約', '')[:50] + '...' if len(str(row.get('要約', ''))) > 50 else row.get('要約', '')
-                })
-        
-        # 両方無効な場合
-        if not problem_valid and not solution_valid:
-            invalid_rows['both'].append(idx + 1)
+        p = str(row.get('課題分類', '')).strip()
+        # 課題分類の検証
+        if (not p or 
+            p.startswith(('エラー:', '分類エラー:')) or 
+            p not in problems or
+            any(pattern in p for pattern in invalid_patterns)):
+            invalid['problem'].append(idx)
+            
+        s = str(row.get('解決手段分類', '')).strip()
+        # 解決手段分類の検証
+        if (not s or 
+            s.startswith(('エラー:', '分類エラー:')) or 
+            s not in solutions or
+            any(pattern in s for pattern in invalid_patterns)):
+            invalid['solution'].append(idx)
+    return invalid
+
+# 分類処理 with retry
+def generate_classification_with_retry(text, def_text, kind, client, model="gpt-4o-mini", retries=3):
+    delay = AVAILABLE_MODELS[model]['delay']
+    # カテゴリ名のリストを抽出
+    categories = extract_valid_categories(def_text)
+    categories_list = ", ".join(categories)
     
-    return invalid_rows
-
-# チェックポイント復旧機能
-def save_checkpoint(data, batch_num, stage):
-    """処理状況をチェックポイントとして保存"""
-    checkpoint = {
-        'data': data,
-        'batch_num': batch_num,
-        'stage': stage,
-        'timestamp': datetime.now()
-    }
-    with open(CHECKPOINT_FILE, 'wb') as f:
-        pickle.dump(checkpoint, f)
-
-def load_checkpoint():
-    """チェックポイントから復旧"""
-    if os.path.exists(CHECKPOINT_FILE):
+    prompt = (
+        f"##Task: Classify the following {kind} into EXACTLY ONE of these categories.\n"
+        f"Categories: {def_text}\n\n"
+        f"Input text: {text}\n\n"
+        f"CRITICAL RULES:\n"
+        f"1. You MUST output ONLY the category name from this list: [{categories_list}]\n"
+        f"2. NEVER output '該当なし', 'N/A', 'その他', 'None', or any similar terms\n"
+        f"3. If uncertain, choose the MOST SIMILAR category based on semantic meaning\n"
+        f"4. Output ONLY the exact category name, nothing else\n"
+        f"5. The output must be one of: {categories_list}\n\n"
+        f"Answer:")
+    
+    for i in range(retries):
         try:
-            with open(CHECKPOINT_FILE, 'rb') as f:
-                return pickle.load(f)
-        except:
-            return None
-    return None
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=50, temperature=0.1
+            )
+            result = resp.choices[0].message.content.strip().strip('[]')
+            
+            # 結果の検証
+            if result not in categories:
+                # もし無効な結果が返された場合、警告を出してリトライ
+                if i < retries - 1:
+                    time.sleep(1)
+                    continue
+                else:
+                    # 最後のリトライでも失敗した場合、最初のカテゴリを返す
+                    return categories[0] if categories else "分類エラー: カテゴリが定義されていません"
+            
+            time.sleep(delay)
+            return result
+        except Exception as e:
+            if i < retries - 1:
+                time.sleep(2 ** i)
+            else:
+                return f"分類エラー: {e}"
 
-def cleanup_checkpoint():
-    """チェックポイントファイルを削除"""
-    if os.path.exists(CHECKPOINT_FILE):
-        os.remove(CHECKPOINT_FILE)
+# 結果表示とチャート出力
+def display_final_results(df, invalid):
+    st.header("📊 最終分類結果")
+    
+    errors = sorted(set(invalid['problem'] + invalid['solution']))
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("総件数", len(df))
+    with col2:
+        st.metric("要確認", len(errors))
 
-# サイドバー設定
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("🎯 課題分類の分布")
+        prob_counts = df['課題分類'].value_counts()
+        if not prob_counts.empty:
+            st.bar_chart(prob_counts)
+        else:
+            st.info("課題分類データがありません")
+    with col2:
+        st.subheader("🔧 解決手段分類の分布")
+        sol_counts = df['解決手段分類'].value_counts()
+        if not sol_counts.empty:
+            st.bar_chart(sol_counts)
+        else:
+            st.info("解決手段分類データがありません")
+
+    # Excel出力用データ準備
+    df_excel = df.copy()
+    df_excel['分類検証結果'] = 'OK'
+    df_excel['問題詳細'] = ''
+    df_excel['使用モデル'] = 'gpt-4o-mini'  # デフォルト
+    
+    # エラー行の記録
+    for idx in invalid['problem']:
+        df_excel.at[idx, '分類検証結果'] = '課題分類エラー'
+        df_excel.at[idx, '問題詳細'] = f"課題分類: {df.at[idx, '課題分類']}"
+    for idx in invalid['solution']:
+        prev = df_excel.at[idx, '分類検証結果']
+        if prev == 'OK':
+            df_excel.at[idx, '分類検証結果'] = '解決手段分類エラー'
+            df_excel.at[idx, '問題詳細'] = f"解決手段分類: {df.at[idx, '解決手段分類']}"
+        else:
+            df_excel.at[idx, '分類検証結果'] = prev + ', 解決手段分類エラー'
+            df_excel.at[idx, '問題詳細'] += f"; 解決手段分類: {df.at[idx, '解決手段分類']}"
+    
+    # 再処理された行にモデル情報を記録
+    if 'reprocessed_indices' in st.session_state and st.session_state.reprocessed_indices:
+        for idx in st.session_state.reprocessed_indices:
+            df_excel.at[idx, '使用モデル'] = PRECISION_REPROCESS_MODEL
+
+    # Excelファイル生成とダウンロードボタン
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine='openpyxl') as writer:
+        df_excel.to_excel(writer, index=False, sheet_name='分類結果')
+        
+        # 概要シートの追加
+        summary_data = {
+            '項目': ['総件数', '正常分類数', 'エラー数', '課題分類エラー', '解決手段分類エラー'],
+            '件数': [
+                len(df),
+                len(df) - len(errors),
+                len(errors),
+                len(invalid['problem']),
+                len(invalid['solution'])
+            ]
+        }
+        summary_df = pd.DataFrame(summary_data)
+        summary_df.to_excel(writer, index=False, sheet_name='概要')
+    
+    buf.seek(0)
+    
+    st.download_button(
+        label="📥 分類結果をダウンロード (Excel)",
+        data=buf.getvalue(),
+        file_name=f"patent_classification_result_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+# 再処理関数
+def reprocess_invalid_classifications(df, invalid, prob_def, sol_def, client):
+    st.subheader(f"🔄 {AVAILABLE_MODELS[PRECISION_REPROCESS_MODEL]['name']}による精密再処理中...")
+    st.info("「該当なし」等の無効な分類を、最も適切なカテゴリに再分類します。")
+    
+    indices = sorted(set(invalid['problem'] + invalid['solution']))
+    st.session_state.reprocessed_indices = indices  # 再処理した行を記録
+    
+    if not indices:
+        st.info("再処理対象なし")
+        return df
+    progress = st.progress(0)
+    total = len(indices)
+    for i, idx in enumerate(indices):
+        row = df.iloc[idx]
+        current_prob = df.at[idx, '課題分類']
+        current_sol = df.at[idx, '解決手段分類']
+        
+        # 無効な分類の場合のみ再処理
+        if idx in invalid['problem']:
+            with st.expander(f"行 {idx+1} - 課題分類を再処理中", expanded=False):
+                st.write(f"現在の分類: {current_prob}")
+                st.write(f"要約: {row['要約'][:100]}...")
+            df.at[idx, '課題分類'] = generate_classification_with_retry(
+                row['要約'], prob_def, 'problem', client, PRECISION_REPROCESS_MODEL)
+        if idx in invalid['solution']:
+            with st.expander(f"行 {idx+1} - 解決手段分類を再処理中", expanded=False):
+                st.write(f"現在の分類: {current_sol}")
+                st.write(f"要約: {row['要約'][:100]}...")
+            df.at[idx, '解決手段分類'] = generate_classification_with_retry(
+                row['要約'], sol_def, 'solution', client, PRECISION_REPROCESS_MODEL)
+        progress.progress((i+1)/total)
+    st.success("✅ 精密再処理完了")
+    return df
+
+# サイドバー
 with st.sidebar:
     st.header("⚙️ 設定")
+    st.subheader("🔑 APIキー")
+    api_key = st.text_input("OpenAI API Key", type="password")
+    client = OpenAI(api_key=api_key) if api_key else None
+    st.subheader("🤖 モデル設定")
+    st.info(f"初回: {AVAILABLE_MODELS['gpt-4o-mini']['name']} | 再処理: {AVAILABLE_MODELS[PRECISION_REPROCESS_MODEL]['name']}")
     
-    # APIキー入力
-    st.subheader("🔑 OpenAI API設定")
-    api_key = st.text_input(
-        "APIキー",
-        type="password",
-        help="OpenAI Platform (https://platform.openai.com/api-keys) で取得できます"
-    )
+    # 分類ルールの説明
+    with st.expander("📋 分類ルール", expanded=False):
+        st.markdown("""
+        **重要な分類ルール:**
+        - ✅ 必ず定義されたカテゴリから選択
+        - ❌ 「該当なし」は絶対に出力しない
+        - 🎯 不確実な場合は最も近いカテゴリを選択
+        - 🔄 無効な分類は自動的に再処理
+        """)
     
-    if api_key:
-        st.success("APIキーが設定されました ✅")
-        # OpenAI クライアント初期化
-        client = OpenAI(api_key=api_key)
-    else:
-        st.warning("APIキーを入力してください")
-        client = None
-    
-    # バッチサイズ設定
-    st.subheader("⚙️ 処理設定")
-    batch_size = st.slider("バッチサイズ", 10, 100, BATCH_SIZE, 10)
-    st.info(f"データを{batch_size}件ずつ処理します")
-    
-    # チェックポイント管理
-    st.subheader("💾 復旧機能")
-    checkpoint = load_checkpoint()
-    if checkpoint:
-        st.warning(f"⚠️ 未完了の処理があります")
-        st.info(f"時刻: {checkpoint['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}")
-        st.info(f"バッチ: {checkpoint['batch_num']}")
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("🔄 処理を再開", type="primary"):
-                st.session_state.processing_state = checkpoint
-                st.rerun()
-        with col2:
-            if st.button("🗑️ リセット"):
-                cleanup_checkpoint()
-                st.rerun()
+    # リセットボタン
+    if st.button("🔄 新規処理を開始"):
+        for key in list(st.session_state.keys()):
+            del st.session_state[key]
+        st.rerun()
 
-# 分類定義入力（元のコードと同じ）
-col1, col2 = st.columns([1, 1])
-
+# 分類定義入力
+col1, col2 = st.columns(2)
 with col1:
-    st.subheader("📝 課題分類定義の入力")
-    problem_classification = st.text_area(
-        "課題分類カテゴリ",
-        value="""[モータ効率・性能向上] 説明文: 電気モータの効率改善、小型化...""",
-        height=200,
-        key="problem_def"
-    )
-
+    st.subheader("📝 課題分類定義入力")
+    problem_def = st.text_area(
+        "課題分類",
+        value="""[モータ効率・性能向上] 説明文: 電気モータの効率改善、小型化、高出力化に関する課題
+[バッテリー技術] 説明文: バッテリーの容量、寿命、充電速度、安全性に関する課題
+[制御システム] 説明文: モータ制御、インバータ制御、システム統合に関する課題""",
+        height=200)
 with col2:
-    st.subheader("🔧 解決手段分類定義の入力")
-    solution_classification = st.text_area(
-        "解決手段分類カテゴリ",
-        value="""[モータ構造の最適化] 説明文: ブラシレスモータのロータ...""",
-        height=200,
-        key="solution_def"
-    )
+    st.subheader("🔧 解決手段分類定義入力")
+    solution_def = st.text_area(
+        "解決手段分類",
+        value="""[モータ構造の最適化] 説明文: ブラシレスモータのロータやステータ構造の改良
+[材料技術の改善] 説明文: 新素材の採用、磁石材料の改良、絶縁材料の向上
+[制御アルゴリズム] 説明文: 高効率制御手法、ベクトル制御、センサレス制御""",
+        height=200)
 
-# ファイルアップロード
-st.subheader("📁 データファイルアップロード")
-uploaded_file = st.file_uploader(
-    "Excelファイルを選択してください",
-    type=['xlsx'],
-    help="「要約」列を含むExcelファイル (.xlsx) をアップロードしてください"
-)
-
-# 改良された分類処理関数
-def generate_classification_with_retry(text, classification_def, classification_type, client, max_retries=3):
-    """リトライ機能付き分類処理（GPT-4o-mini用）"""
-    for attempt in range(max_retries):
-        try:
-            if classification_type == "problem":
-                prompt = f"""##Task: Classify the input problem description into one of the problem categories below. You MUST select the most appropriate category from the list. Do not answer "該当するカテゴリはありません" or similar. Output only the category name in Japanese WITHOUT square brackets [].
-
-##Problem Categories: {classification_def}
-
-##Instructions:
-1. Read the input description carefully
-2. Compare it with ALL categories
-3. Select the MOST appropriate category (even if not perfect match)
-4. Output ONLY the category name without brackets []
-5. Answer in Japanese only
-
-##Input: {text}
-
-##Answer (category name only, no brackets):"""
-            else:
-                prompt = f"""##Task: Classify the input solution description into one of the solution categories below. You MUST select the most appropriate category from the list. Do not answer "該当するカテゴリはありません" or similar. Output only the category name in Japanese WITHOUT square brackets [].
-
-##Solution Categories: {classification_def}
-
-##Instructions:
-1. Read the input description carefully
-2. Compare it with ALL categories
-3. Select the MOST appropriate category (even if not perfect match)
-4. Output ONLY the category name without brackets []
-5. Answer in Japanese only
-
-##Input: {text}
-
-##Answer (category name only, no brackets):"""
-            
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=50,
-                temperature=0.1
-            )
-            
-            result = response.choices[0].message.content.strip()
-            
-            # []括弧がある場合は除去
-            if result.startswith('[') and result.endswith(']'):
-                result = result[1:-1]
-            
-            return result
-            
-        except Exception as e:
-            if attempt < max_retries - 1:
-                st.warning(f"API エラー (試行 {attempt + 1}): {str(e)} - リトライします...")
-                time.sleep(2 ** attempt)  # 指数バックオフ
-            else:
-                return f"分類エラー: {str(e)}"
-
-def process_batch(df_batch, start_idx, problem_def, solution_def, stage, client):
-    """バッチ処理"""
-    batch_results = []
+# 処理完了後の結果表示
+if st.session_state.processing_complete and st.session_state.processed_df is not None:
+    df = st.session_state.processed_df
     
-    for i, (idx, row) in enumerate(df_batch.iterrows()):
-        current_idx = start_idx + i
+    # 手動修正が必要で、まだ完了していない場合
+    if st.session_state.need_manual_correction and not st.session_state.manual_correction_complete:
+        st.warning("🔴 再処理後も未分類項目があります。手動で修正してください。")
         
-        try:
-            if stage in ['problem', 'both']:
-                # 課題分類
-                p_class = generate_classification_with_retry(
-                    row['要約'], problem_def, "problem", client
+        # カテゴリリストを取得
+        probs = extract_valid_categories(st.session_state.problem_def_used)
+        sols = extract_valid_categories(st.session_state.solution_def_used)
+        
+        invalid = st.session_state.final_invalid
+        indices = sorted(set(invalid['problem'] + invalid['solution']))
+        
+        # 手動修正用の入力フィールド
+        st.markdown("### 📝 手動修正")
+        for idx in indices:
+            row = df.iloc[idx]
+            st.markdown(f"**行 {idx+1}** - 要約: {row['要約'][:100]}...")
+            col1, col2 = st.columns(2)
+            with col1:
+                manual_prob = st.text_input(
+                    f"課題分類 (現在: {row['課題分類']})", 
+                    value=row['課題分類'], 
+                    key=f"manual_prob_{idx}"
                 )
-                batch_results.append({
-                    'index': idx,
-                    'problem_class': p_class,
-                    'solution_class': None
-                })
-            
-            if stage in ['solution', 'both']:
-                # 解決手段分類
-                s_class = generate_classification_with_retry(
-                    row['要約'], solution_def, "solution", client
+            with col2:
+                manual_sol = st.text_input(
+                    f"解決手段分類 (現在: {row['解決手段分類']})", 
+                    value=row['解決手段分類'], 
+                    key=f"manual_sol_{idx}"
                 )
-                
-                if stage == 'solution' and batch_results:
-                    batch_results[i]['solution_class'] = s_class
-                elif stage == 'both':
-                    batch_results[i]['solution_class'] = s_class
-                else:
-                    batch_results.append({
-                        'index': idx,
-                        'problem_class': None,
-                        'solution_class': s_class
-                    })
+            st.markdown("---")
+        
+        # 手動修正の確定ボタン
+        if st.button("✅ 手動修正を確定してExcelをダウンロード", type="primary"):
+            # 手動修正の適用
+            for idx in indices:
+                df.at[idx, '課題分類'] = st.session_state[f"manual_prob_{idx}"]
+                df.at[idx, '解決手段分類'] = st.session_state[f"manual_sol_{idx}"]
             
-            # レート制限
-            time.sleep(RATE_LIMIT_DELAY)
+            # 最終検証
+            final_invalid = validate_classification_results(df, probs, sols)
             
-        except Exception as e:
-            st.error(f"行 {current_idx} でエラー: {str(e)}")
-            batch_results.append({
-                'index': idx,
-                'problem_class': f"エラー: {str(e)}",
-                'solution_class': f"エラー: {str(e)}"
-            })
+            # セッション状態を更新
+            st.session_state.processed_df = df
+            st.session_state.final_invalid = final_invalid
+            st.session_state.manual_correction_complete = True
+            st.rerun()
     
-    return batch_results
-
-if uploaded_file is not None:
-    try:
-        df = pd.read_excel(uploaded_file)
-        
-        if '要約' not in df.columns:
-            st.error("❌ エラー: 「要約」列が見つかりません")
+    # 処理完了後の結果表示
+    else:
+        if st.session_state.final_invalid is not None:
+            display_final_results(df, st.session_state.final_invalid)
         else:
-            st.success("✅ ファイル読み込み完了")
-            st.info(f"{len(df)}行のデータが読み込まれました")
-            
-            # データプレビュー
-            with st.expander("📊 データプレビュー", expanded=False):
-                st.dataframe(df.head(10), use_container_width=True)
-            
-            # 処理時間の推定
-            total_batches = (len(df) + batch_size - 1) // batch_size
-            estimated_time = len(df) * RATE_LIMIT_DELAY * 2 / 60  # GPT-4o-mini用の短縮時間
-            
-            st.subheader("🚀 分類処理")
-            st.info(f"📊 総データ数: {len(df)}件")
-            st.info(f"📦 バッチ数: {total_batches}バッチ")
-            st.info(f"⏱️ 推定処理時間: 約{estimated_time:.1f}分")
-            
-            # 処理開始ボタン
-            if st.button("🚀 分類処理開始", type="primary", disabled=not client):
-                if not client:
-                    st.error("❌ APIキーが必要です")
+            display_final_results(df, st.session_state.invalid_rows_data)
+
+# ファイルアップロード＆処理（処理が完了していない場合のみ表示）
+elif not st.session_state.processing_complete:
+    st.subheader("📁 ファイルアップロード")
+    uploaded = st.file_uploader("Excel (.xlsx)", type=['xlsx'])
+    if uploaded:
+        df = pd.read_excel(uploaded)
+        if '要約' not in df.columns:
+            st.error("「要約」列がありません")
+        else:
+            total = len(df)
+            st.success(f"{total}件読み込み完了")
+            with st.expander("データプレビュー", False):
+                st.dataframe(df.head())
+            if st.button("分類開始", disabled=not client):
+                progress = st.progress(0)
+                status = st.empty()
+                
+                # 定義を保存
+                st.session_state.problem_def_used = problem_def
+                st.session_state.solution_def_used = solution_def
+                
+                for idx, row in df.iterrows():
+                    df.at[idx, '課題分類'] = generate_classification_with_retry(
+                        row['要約'], problem_def, 'problem', client)
+                    df.at[idx, '解決手段分類'] = generate_classification_with_retry(
+                        row['要約'], solution_def, 'solution', client)
+                    progress.progress((idx+1)/total)
+                    status.text(f"処理中: {idx+1}/{total}")
+
+                # 初回検証
+                probs = extract_valid_categories(problem_def)
+                sols = extract_valid_categories(solution_def)
+                invalid = validate_classification_results(df, probs, sols)
+                st.session_state.invalid_rows_data = invalid
+                st.session_state.processed_df = df.copy()
+
+                if invalid['problem'] or invalid['solution']:
+                    st.info("⚙️ 問題が検出されました。自動でGPT-4.1再処理を開始します...")
+                    df = reprocess_invalid_classifications(df, invalid, problem_def, solution_def, client)
+
+                    # 再処理後の再検証
+                    new_invalid = validate_classification_results(df, probs, sols)
+                    st.session_state.final_invalid = new_invalid
+                    st.session_state.processed_df = df.copy()
+
+                    if new_invalid['problem'] or new_invalid['solution']:
+                        st.session_state.need_manual_correction = True
+                        st.session_state.processing_complete = True
+                        st.rerun()
+                    else:
+                        st.success("✅ 再処理で全て正常に分類されました")
+                        st.session_state.processing_complete = True
+                        st.session_state.need_manual_correction = False
+                        st.rerun()
                 else:
-                    # 処理状況の表示
-                    progress_container = st.container()
-                    log_container = st.empty()
-                    
-                    with progress_container:
-                        progress_bar = st.progress(0)
-                        status_text = st.empty()
-                        batch_info = st.empty()
-                    
-                    try:
-                        # 結果格納用の列を初期化
-                        if '課題分類' not in df.columns:
-                            df['課題分類'] = ""
-                        if '解決手段分類' not in df.columns:
-                            df['解決手段分類'] = ""
-                        
-                        start_time = datetime.now()
-                        
-                        # バッチ処理ループ
-                        for batch_num in range(total_batches):
-                            start_idx = batch_num * batch_size
-                            end_idx = min(start_idx + batch_size, len(df))
-                            df_batch = df.iloc[start_idx:end_idx]
-                            
-                            # プログレス更新
-                            progress = (batch_num / total_batches)
-                            progress_bar.progress(progress)
-                            status_text.text(f"バッチ {batch_num + 1}/{total_batches} 処理中...")
-                            batch_info.info(f"📦 現在のバッチ: {start_idx + 1}～{end_idx}行目")
-                            
-                            # バッチ処理実行
-                            batch_results = process_batch(
-                                df_batch, start_idx, 
-                                problem_classification, 
-                                solution_classification, 
-                                'both',
-                                client
-                            )
-                            
-                            # 結果をデータフレームに反映
-                            for result in batch_results:
-                                idx = result['index']
-                                if result['problem_class'] is not None:
-                                    df.at[idx, '課題分類'] = result['problem_class']
-                                if result['solution_class'] is not None:
-                                    df.at[idx, '解決手段分類'] = result['solution_class']
-                            
-                            # チェックポイント保存
-                            save_checkpoint(df, batch_num + 1, 'both')
-                            
-                            # ログ更新
-                            elapsed_time = (datetime.now() - start_time).total_seconds() / 60
-                            log_container.info(f"バッチ {batch_num + 1} 完了 (経過時間: {elapsed_time:.1f}分)")
-                        
-                        # 処理完了
-                        progress_bar.progress(1.0)
-                        total_time = (datetime.now() - start_time).total_seconds() / 60
-                        status_text.success(f"✅ 全処理完了！ (処理時間: {total_time:.1f}分)")
-                        
-                        # チェックポイントファイル削除
-                        cleanup_checkpoint()
-                        
-                        # 分類結果の検証
-                        st.header("🔍 分類結果の検証")
-                        
-                        # 有効なカテゴリを抽出
-                        problem_categories = extract_valid_categories(problem_classification)
-                        solution_categories = extract_valid_categories(solution_classification)
-                        
-                        # 検証実行
-                        invalid_rows = validate_classification_results(df, problem_categories, solution_categories)
-                        
-                        # 検証結果の表示
-                        total_invalid = len(invalid_rows['problem']) + len(invalid_rows['solution'])
-                        
-                        if total_invalid == 0:
-                            st.success("✅ すべての分類が正しく付与されています！")
-                        else:
-                            st.error(f"⚠️ {total_invalid}件の分類に問題が見つかりました")
-                            
-                            # 問題の詳細表示
-                            col1, col2 = st.columns(2)
-                            
-                            with col1:
-                                if invalid_rows['problem']:
-                                    st.error(f"❌ 課題分類の問題: {len(invalid_rows['problem'])}件")
-                                    with st.expander("詳細を表示", expanded=True):
-                                        for item in invalid_rows['problem'][:10]:  # 最初の10件のみ表示
-                                            st.write(f"**行 {item['index']}**: '{item['value']}'")
-                                            st.write(f"要約: {item['summary']}")
-                                            st.divider()
-                                        if len(invalid_rows['problem']) > 10:
-                                            st.info(f"他 {len(invalid_rows['problem']) - 10}件...")
-                            
-                            with col2:
-                                if invalid_rows['solution']:
-                                    st.error(f"❌ 解決手段分類の問題: {len(invalid_rows['solution'])}件")
-                                    with st.expander("詳細を表示", expanded=True):
-                                        for item in invalid_rows['solution'][:10]:
-                                            st.write(f"**行 {item['index']}**: '{item['value']}'")
-                                            st.write(f"要約: {item['summary']}")
-                                            st.divider()
-                                        if len(invalid_rows['solution']) > 10:
-                                            st.info(f"他 {len(invalid_rows['solution']) - 10}件...")
-                            
-                            # 有効なカテゴリ一覧の表示
-                            with st.expander("📋 定義されている有効なカテゴリ", expanded=False):
-                                col1, col2 = st.columns(2)
-                                with col1:
-                                    st.write("**課題分類カテゴリ:**")
-                                    for cat in problem_categories:
-                                        st.write(f"• {cat}")
-                                with col2:
-                                    st.write("**解決手段分類カテゴリ:**")
-                                    for cat in solution_categories:
-                                        st.write(f"• {cat}")
-                        
-                        # 結果表示と統計
-                        st.header("📊 分類結果")
-                        
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            st.subheader("🎯 課題分類の分布")
-                            p_counts = df['課題分類'].value_counts()
-                            st.bar_chart(p_counts)
-                        
-                        with col2:
-                            st.subheader("🔧 解決手段分類の分布")
-                            s_counts = df['解決手段分類'].value_counts()
-                            st.bar_chart(s_counts)
-                        
-                        # 結果ダウンロード
-                        st.subheader("💾 結果ダウンロード")
-                        
-                        # 問題のある行にフラグを付けてダウンロード
-                        df_download = df.copy()
-                        df_download['分類検証結果'] = ''
-                        
-                        for item in invalid_rows['problem']:
-                            idx = item['index'] - 1
-                            df_download.at[idx, '分類検証結果'] = '課題分類エラー'
-                        
-                        for item in invalid_rows['solution']:
-                            idx = item['index'] - 1
-                            if df_download.at[idx, '分類検証結果']:
-                                df_download.at[idx, '分類検証結果'] += ', 解決手段分類エラー'
-                            else:
-                                df_download.at[idx, '分類検証結果'] = '解決手段分類エラー'
-                        
-                        output_buffer = io.BytesIO()
-                        with pd.ExcelWriter(output_buffer, engine='openpyxl') as writer:
-                            df_download.to_excel(writer, index=False, sheet_name='分類結果')
-                        
-                        st.download_button(
-                            label="📥 Excelファイルでダウンロード（検証結果付き）",
-                            data=output_buffer.getvalue(),
-                            file_name=f"classification_result_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                        )
-                        
-                    except Exception as e:
-                        st.error(f"❌ 処理エラー: {str(e)}")
-                        st.error("処理を中断しました。サイドバーから再開できます。")
-                        
-    except Exception as e:
-        st.error(f"❌ ファイル読み込みエラー: {str(e)}")
+                    st.success("✅ 全て正常に分類されました")
+                    st.session_state.processing_complete = True
+                    st.session_state.need_manual_correction = False
+                    st.rerun()
 
 # フッター
 st.markdown("---")
-st.markdown("### 🔬 PatentScope AI - GPT-4o-mini Edition")
-st.markdown("**Powered by OpenAI GPT-4o-mini | 安定性向上版**")
+st.markdown("**Powered by OpenAI GPT Models**")
