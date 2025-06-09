@@ -45,7 +45,7 @@ if 'solution_def_used' not in st.session_state:
 
 # ヘッダー
 st.title("🔬 課題分類・解決手段分類あてはめアプリ")
-st.subheader("-AI駆動型自動分類あてはめアプリ")
+st.subheader("-AI自動分類マッピング")
 
 with st.expander("🔧 最新機能", expanded=False):
     st.markdown("""
