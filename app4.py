@@ -410,4 +410,4 @@ elif not st.session_state.processing_complete:
 # フッター
 st.markdown("---")
 st.markdown("**Powered by OpenAI GPT Models**")
-st.markdown("**Ⓒ2025**")
+st.markdown("KawakamiⒸ2025")
