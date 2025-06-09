@@ -8,7 +8,7 @@ from openai import OpenAI
 
 # ページ設定
 st.set_page_config(
-    page_title="PatentClassifier AI",
+    page_title="課題分類・解決手段分類あてはめアプリ",
     page_icon="🔬",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -44,8 +44,8 @@ if 'solution_def_used' not in st.session_state:
     st.session_state.solution_def_used = None
 
 # ヘッダー
-st.title("🔬 PatentClassifier AI")
-st.subheader("-AI駆動型特許自動分類アプリ")
+st.title("🔬 課題分類・解決手段分類あてはめアプリ")
+st.subheader("-AI駆動型自動分類あてはめアプリ")
 
 with st.expander("🔧 最新機能", expanded=False):
     st.markdown("""
@@ -410,3 +410,4 @@ elif not st.session_state.processing_complete:
 # フッター
 st.markdown("---")
 st.markdown("**Powered by OpenAI GPT Models**")
+st.markdown("**Ⓒ2025**")
